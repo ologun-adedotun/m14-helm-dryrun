@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["replicaCount", "image", "config", "service", "resources"],
+  "properties": {
+    "replicaCount": { "type": "integer", "minimum": 1, "maximum": 10 },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "pullPolicy"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string", "not": { "const": "latest" } },
+        "pullPolicy": { "enum": ["IfNotPresent", "Always", "Never"] }
+      }
+    },
+    "imagePullSecrets": { "type": "array", "items": { "type": "object", "required": ["name"] } },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "APP_NAME": { "type": "string" },
+        "GREETING": { "type": "string" },
+        "LOG_LEVEL": { "enum": ["DEBUG", "INFO", "WARNING", "ERROR"] },
+        "READY_AFTER_SECONDS": { "type": "string", "pattern": "^[0-9]+$" }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "port": { "type": "integer" } }
+    },
+    "resources": { "type": "object" },
+    "podDisruptionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "enabled": { "type": "boolean" }, "minAvailable": { "type": "integer", "minimum": 0 } }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "allowFromNamespaces": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}
