@@ -1,0 +1,89 @@
+name: Chart
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  HELM_VERSION: v4.3.0
+  CHART: charts/maright-app
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - run: helm version
+      - name: Lint, strictly
+        run: helm lint --strict $CHART -f $CHART/ci/kind-values.yaml
+      - name: The schema refuses a latest tag
+        run: "! helm template t $CHART --set image.tag=latest"
+      - name: The schema refuses a misspelt key
+        run: "! helm template t $CHART --set replicaCont=3"
+      - name: Validate rendered manifests against Kubernetes 1.37
+        run: |
+          curl -sL https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz | tar xz kubeconform
+          helm template t $CHART -f $CHART/ci/kind-values.yaml | ./kubeconform -strict -summary -kubernetes-version 1.37.0
+      - name: Unit tests
+        run: |
+          helm plugin install https://github.com/helm-unittest/helm-unittest.git --version v1.2.1 --verify=false
+          helm unittest $CHART
+
+  install:
+    needs: checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - uses: helm/chart-testing-action@v2
+      - uses: helm/kind-action@v1
+      - name: Build the app and load it into kind
+        run: |
+          docker build -q -t maright-app:v1 ./app
+          kind load docker-image maright-app:v1 --name chart-testing
+      - name: chart-testing install
+        run: ct install --charts $CHART --target-branch ${{ github.event.repository.default_branch }}
+      - name: Install into a namespace enforcing Pod Security restricted
+        run: |
+          kubectl create namespace guarded
+          kubectl label namespace guarded pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/enforce-version=v1.37
+          helm upgrade --install demo $CHART -n guarded -f $CHART/ci/kind-values.yaml --wait --timeout 3m --rollback-on-failure
+          helm test demo -n guarded --timeout 2m
+      - name: A settings change rolls the pods by itself
+        run: |
+          BEFORE=$(kubectl get deploy demo -n guarded -o jsonpath='{.spec.template.metadata.annotations.checksum/config}')
+          helm upgrade demo $CHART -n guarded -f $CHART/ci/kind-values.yaml --set config.GREETING=changed --wait --timeout 3m --rollback-on-failure
+          AFTER=$(kubectl get deploy demo -n guarded -o jsonpath='{.spec.template.metadata.annotations.checksum/config}')
+          echo "before=$BEFORE after=$AFTER"
+          test "$BEFORE" != "$AFTER"
+          helm history demo -n guarded
+          kubectl get pods -n guarded
+
+  publish:
+    needs: install
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - name: Package and push the chart as an OCI artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "$GH_TOKEN" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          helm package $CHART
+          helm push maright-app-*.tgz oci://ghcr.io/$OWNER/charts
