@@ -1,0 +1,28 @@
+suite: deployment
+templates:
+  - templates/deployment.yaml
+  - templates/configmap.yaml
+tests:
+  - it: runs as a numbered non-root user with no privilege escalation
+    template: templates/deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.runAsUser
+          value: 65534
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation
+          value: false
+  - it: uses appVersion when no tag is given
+    template: templates/deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: maright-app:v1
+  - it: changes the config checksum when a setting changes
+    template: templates/deployment.yaml
+    set:
+      config.GREETING: something else
+    asserts:
+      - notEqual:
+          path: spec.template.metadata.annotations["checksum/config"]
+          value: ""
