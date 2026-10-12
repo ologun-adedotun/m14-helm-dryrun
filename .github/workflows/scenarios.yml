@@ -1,0 +1,84 @@
+name: Scenarios
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/scenarios.yml"]
+
+permissions:
+  contents: read
+
+env:
+  CHART: charts/maright-app
+  VALUES: charts/maright-app/ci/kind-values.yaml
+
+jobs:
+  scenarios:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+        with:
+          version: v4.3.0
+      - uses: helm/kind-action@v1
+      - name: Build, load, install revision 1
+        run: |
+          docker build -q -t maright-app:v1 ./app
+          kind load docker-image maright-app:v1 --name chart-testing
+          kubectl create namespace s
+          helm upgrade --install demo $CHART -n s -f $VALUES --wait --timeout 3m
+      - name: "1. A selector change on upgrade"
+        run: |
+          set +e
+          cp -r $CHART /tmp/c2
+          sed -i 's#^app.kubernetes.io/instance: {{ .Release.Name }}#app.kubernetes.io/instance: {{ .Release.Name }}\napp.kubernetes.io/part-of: mission-control#' /tmp/c2/templates/_helpers.tpl
+          helm upgrade demo /tmp/c2 -n s -f $VALUES --wait --timeout 2m --rollback-on-failure 2>&1 | tail -n 4
+          echo "upgrade exit: ${PIPESTATUS[0]}"
+          helm history demo -n s
+          helm status demo -n s | grep STATUS
+      - name: "2. A values typo with no schema"
+        run: |
+          set +e
+          cp -r $CHART /tmp/c3
+          mv /tmp/c3/values.schema.json /tmp/schema-moved-aside.json
+          helm upgrade demo /tmp/c3 -n s -f $VALUES --set replicaCont=4 --wait --timeout 2m 2>&1 | tail -n 2
+          echo "upgrade exit: ${PIPESTATUS[0]}"
+          kubectl get deploy demo -n s -o jsonpath='{.spec.replicas}'; echo " replicas"
+      - name: "3. A release stuck in pending-upgrade"
+        run: |
+          set +e
+          timeout -s KILL 15 helm upgrade demo $CHART -n s -f $VALUES --set image.tag=v-missing --wait --timeout 5m
+          echo "killed helm, exit $?"
+          helm status demo -n s | grep STATUS
+          helm upgrade demo $CHART -n s -f $VALUES --wait --timeout 2m 2>&1 | tail -n 2
+          echo "next upgrade exit: ${PIPESTATUS[0]}"
+          helm history demo -n s | tail -n 3
+          helm rollback demo -n s --wait --timeout 2m 2>&1 | tail -n 1
+          helm status demo -n s | grep STATUS
+      - name: "4. Someone scaled by hand, then Helm upgrades (server-side apply)"
+        run: |
+          set +e
+          kubectl scale deploy demo -n s --replicas=3
+          kubectl get deploy demo -n s -o jsonpath='{.spec.replicas}'; echo " replicas after kubectl scale"
+          helm upgrade demo $CHART -n s -f $VALUES --set config.GREETING=again --wait --timeout 2m 2>&1 | tail -n 3
+          echo "upgrade exit: ${PIPESTATUS[0]}"
+          kubectl get deploy demo -n s -o jsonpath='{.spec.replicas}'; echo " replicas after helm upgrade"
+          helm upgrade demo $CHART -n s -f $VALUES --set config.GREETING=again2 --force-conflicts --wait --timeout 2m 2>&1 | tail -n 1
+          echo "upgrade with --force-conflicts exit: ${PIPESTATUS[0]}"
+          kubectl get deploy demo -n s -o jsonpath='{.spec.replicas}'; echo " replicas after --force-conflicts"
+      - name: "5. Kustomize overlay"
+        run: |
+          mkdir -p /tmp/k/base /tmp/k/overlay
+          helm template demo $CHART -f $VALUES > /tmp/k/base/all.yaml
+          printf 'resources:\n  - all.yaml\n' > /tmp/k/base/kustomization.yaml
+          printf 'resources:\n  - ../base\nnamePrefix: blue-\npatches:\n  - target:\n      kind: Deployment\n    patch: |-\n      - op: replace\n        path: /spec/replicas\n        value: 3\n' > /tmp/k/overlay/kustomization.yaml
+          kubectl kustomize /tmp/k/overlay | grep -E '^kind:|^  name:|replicas:'
+      - name: "6. metrics-server from its pinned chart"
+        run: |
+          helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
+          helm search repo metrics-server/metrics-server --versions | head -n 4
+          CV=$(helm search repo metrics-server/metrics-server -o json | jq -r '.[0].version')
+          echo "chart version $CV"
+          helm upgrade --install metrics-server metrics-server/metrics-server -n kube-system --version "$CV" --set 'args={--kubelet-insecure-tls}' --wait --timeout 3m
+          for i in $(seq 12); do kubectl top nodes 2>/dev/null && break; sleep 10; done
+          kubectl top pods -n s 2>&1 | head -n 4
